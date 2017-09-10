@@ -1,0 +1,222 @@
+---
+title: 'Edward Example: Dirichlet Process'
+output:
+  html_document:
+    toc: yes
+  html_notebook:
+    toc: yes
+---
+
+## Preface
+
+This is an R implementation of the Edward example [Python script for Dirichlet process priors](https://github.com/blei-lab/edward/blob/master/examples/pp_dirichlet_process.py).
+
+(*Implemented under Edward's [license instructions](http://edwardlib.org/license), i.e., [Apache License, version 2.0](https://opensource.org/licenses/Apache-2.0).*)
+
+## Setup
+
+First, load the R packages and then import the Edward module into the underlying Python system.
+
+```{r package, message=FALSE, warning=FALSE}
+
+library( magrittr )
+library( tidyverse )
+library( reticulate ) # R interface to Python
+library( tensorflow )
+
+ed   <- import( module = "edward" )
+
+#from edward.models import 
+Bernoulli         <- ed$models$Bernoulli
+Beta              <- ed$models$Beta
+DirichletProcess  <- ed$models$DirichletProcess
+Exponential       <- ed$models$Exponential
+Normal            <- ed$models$Normal
+MvNormalDiag      <- ed$models$MultivariateNormalDiag
+```
+
+
+## Dirichlet process.
+
+We implement sample generation from a Dirichlet process (with no base
+distribution) via its stick breaking construction. It is a streamlined
+implementation of the ``DirichletProcess`` random variable in Edward.
+
+### References
+
+[Probabilistic Models of Cognition: Chapter 12, Non-parametric Models](https://probmods.org/chapters/12-non-parametric-models.html#infinite-discrete-distributions-the-dirichlet-processes) by Noah D. Goodman & Joshua B. Tenenbaum 
+
+
+## Stick-Breaking Construction
+
+First, demonstrate Stick-breaking process as a function.
+
+```{r def_funcs}
+
+dirichlet_process <- function( alpha ){
+  #"""Demo of stochastic while loop for stick breaking construction."""
+  cond <- function( k, beta_k ){
+    # End while loop (return False) when flip is heads.
+    flip <- Bernoulli( beta_k )
+    return( tf$logical_not( tf$cast( flip , tf$bool ) ) )
+  }
+
+  body <- function( k, beta_k ){
+    beta_k <- Beta( 1.0, alpha )
+    return( list( k + 1L, beta_k ) )
+  }
+
+  k      <- tf$constant( 0L )
+  beta_k <- Beta( 1.0, alpha )
+  result <- tf$while_loop( cond, body, loop_vars = list( k, beta_k ) )
+  return( result )
+}
+```
+
+```{r make_dp}
+tf$reset_default_graph()
+ed$set_seed( 42L )
+
+dp <- dirichlet_process( alpha = 10.0 )
+
+# The number of sticks broken is dynamic, changing across evaluations.
+#sess <- tf$Session()
+sess <- ed$get_session()
+print( sess$run( dp ) )
+print( sess$run( dp ) )
+```
+
+## Edward's `DirichletProcess` Random Variables
+
+Now, demonstrate the built-in Edward `DirichletProcess` random variables.
+
+
+```{r demo_dp}
+# Demo of the DirichletProcess random variable in Edward.
+base <- Normal(0.0, 1.0)
+
+N_sample <- 10000L
+
+# Highly concentrated DP.
+alpha <- 1.0
+
+dp    <- DirichletProcess(alpha, base)
+x     <- dp$sample( N_sample )
+samples <- sess$run(x)
+
+data_frame( samples = samples ) %>%
+{
+ggplot( data = ., aes(x = samples) ) +
+    geom_histogram( bins=100 ) +
+    lims( x = c(-3.0, 3.0) ) +
+    ggtitle( sprintf("DP(%g, N(0, 1))", alpha) )
+} %>% 
+  print()
+```
+
+```{r spread_dp}
+# More spread out DP.
+alpha   <- 50.0
+
+dp      <- DirichletProcess(alpha, base)
+x       <- dp$sample( N_sample )
+samples <- sess$run(x)
+data_frame( samples = samples ) %>%
+{
+ggplot( data = ., aes(x = samples) ) +
+    geom_histogram( bins=100 ) +
+    lims( x = c(-3.0, 3.0) ) +
+    ggtitle( sprintf("DP(%g, N(0, 1))", alpha) )
+} %>% 
+  print()
+```
+
+
+States persist across calls to sample() in a DP.
+
+```{r persistence}
+# States persist across calls to sample() in a DP.
+alpha <- 1.0
+dp <- DirichletProcess(alpha, base)
+N_samp <- c(samples_x = 50L, samples_y = 75L )
+x  <- dp$sample(N_samp[1])
+y  <- dp$sample(N_samp[2])
+result <- sess$run(list(x, y)) %>% setNames( names(N_samp))
+
+data_frame( 
+  samples = do.call(c,result), 
+  label = rep(names(N_samp),times=N_samp) 
+) %>%
+{
+ggplot( data = ., aes(x = samples ) ) +
+    geom_histogram( bins = 100 ) +
+    lims( x = c(-3.0, 3.0) ) +
+    ggtitle( sprintf("DP(%g, N(0, 1))", alpha) ) +
+    facet_wrap( ~label)
+} %>% 
+  print()
+
+```
+
+
+
+The random variable `theta` is the distribution indirectly returned by the DP.
+Fetching `theta` is the same as fetching the Dirichlet process.
+
+```{r induced }
+# ``theta`` is the distribution indirectly returned by the DP.
+# Fetching theta is the same as fetching the Dirichlet process.
+dp <- DirichletProcess(alpha, base)
+theta <- Normal(0.0, 1.0, value=tf$cast(dp, tf$float32))
+print(sess$run(list(dp, theta)))
+print(sess$run(list(dp, theta)))
+```
+
+DirichletProcess can also take in non-scalar concentrations and bases.
+
+```{r nonscalar }
+# DirichletProcess can also take in non-scalar concentrations and bases.
+alpha <- tf$constant(list(0.1, 0.6, 0.4))
+base <- Exponential( rate = tf$ones( c(5L, 2L) ) )
+dp <-  DirichletProcess(alpha, base)
+print(dp)
+print(sess$run(dp))
+```
+
+
+## Multivariate Base
+
+{MLT}: Does it work with a multivariate base distribution?
+
+```{r multivar}
+
+# Demo of the DirichletProcess random variable in Edward.
+base <- MvNormalDiag(
+  loc = c(1., -1),
+  scale_diag = c(1, 2.)
+)
+
+N_sample <- 10000L
+
+alpha <- 1.0/100.0
+
+dp    <- DirichletProcess( alpha, base )
+x     <- dp$sample( N_sample )
+samples <- sess$run(x)
+
+samples %>%
+  as_data_frame() %>%
+  setNames( c( "X1","X2" ) ) %>%
+{
+ggplot( data = ., aes(x = X1, y = X2 ) ) +
+    stat_density2d( aes(alpha=..level..), geom="polygon") +
+    geom_point( color = 'red', alpha = 0.3 ) +
+    lims( x = c(-5.0, 5.0), y = c(-5.0, 5.0 ) ) +
+    ggtitle( sprintf("DP(%g, MvN({1,-1}, diag({1,2})))", alpha) )
+} %>% 
+  print()
+
+```
+
+
+
