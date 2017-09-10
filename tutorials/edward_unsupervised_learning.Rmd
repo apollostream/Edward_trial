@@ -3,13 +3,13 @@ title: 'Edward: Unsupervised Learning of Finite Mixture Models'
 author: "Michael L. Thompson"
 date: "May 8, 2017, rev. Sept. 9, 2017"
 output:
-  pdf_document:
-    toc: yes
-    toc_depth: 4
   html_notebook:
     toc: yes
   html_document:
     toc: yes
+  pdf_document:
+    toc: yes
+    toc_depth: 4
 linkcolor: red
 urlcolor: blue
 ---
@@ -111,7 +111,7 @@ build_toy_dataset <- function(
 }
 
 N <- 500L  # number of data points
-K <- 2L  # number of components
+K <- 3L  # number of components
 D <- 2L  # dimensionality of data
 
 tf$reset_default_graph()
@@ -128,7 +128,7 @@ x_train %>% as_data_frame() %>% setNames( c("X1", "X2" ) ) %>%
 {
   ggplot(.,aes(x=X1,y=X2)) +
     geom_point(fill='red',color='red',shape=21,size=2) +
-    lims( x= c(-3,3), y= c(-3,3) )
+    lims( x= (K+1)*c(-1,1), y= (K+1)*c(-1,1) )
 } %>% print()
 ```
 
@@ -217,7 +217,8 @@ input a Categorical distribution and a list of individual distribution
 components. It is the distribution of the mixture summing out the
 mixture assignments.
 
-```{r model_collapsed, eval=FALSE }
+```{python model_collapsed, eval=FALSE }
+""""
 pi = Dirichlet(tf.ones(K))
 mu = Normal(tf.zeros(D), tf.ones(D), sample_shape=K)
 sigma = InverseGamma(tf.ones(D), tf.ones(D), sample_shape=K)
@@ -226,7 +227,7 @@ components = [
     MultivariateNormalDiag(mu[k], sigma[k], sample_shape=N)
     for k in range(K)]
 x = Mixture(cat=cat, components=components)
-
+""""
 ```
 
 We will use the joint version in this analysis.
@@ -264,7 +265,7 @@ tf$global_variables_initializer()$run()
 
 t_ph = tf$placeholder(tf$int32, c())
 running_cluster_means = tf$reduce_mean(
-  tf$slice( qmu$params, begin = rep(0L,3), size = c(t_ph,2L,2L)), 
+  tf$slice( qmu$params, begin = rep(0L,3), size = c(t_ph,K,D)), 
   0L
 )
 
@@ -333,7 +334,7 @@ Plot the data points, colored by their predicted membership.
 df_means <- running_cluster_means$eval(dict('t_ph'=t)) %>% 
   as_tibble() %>% 
   setNames(sprintf("X%d",seq_len(D))) %>% 
-  mutate(cluster=factor(0:1), c_name = sprintf("C%s",as.character(cluster)))
+  mutate(cluster=factor(0:(K-1)), c_name = sprintf("C%s",as.character(cluster)))
 
 x_train %>% 
   as_tibble() %>% 
@@ -342,7 +343,7 @@ x_train %>%
   {
     ggplot(., aes(x = X1, y = X2, color = cluster )) +
       geom_point() +
-      lims( x = c(-3,3), y = c(-3,3) ) +
+      lims( x = (K+1)*c(-1,1), y = (K+1)*c(-1,1) ) +
       ggtitle("Predicted cluster assignments") +
       geom_text( 
         data      = df_means, 
