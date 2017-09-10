@@ -1,0 +1,207 @@
+---
+title: 'R Markdown port of "Edward: Linear Mixed Effects Models" tutorial'
+author: "Michael L. Thompson"
+date: "July 30, 2017"
+output:
+  pdf_document:
+    toc: yes
+  html_notebook:
+    toc: yes
+  html_document:
+    toc: yes
+linkcolor: red
+urlcolor: blue
+---
+
+## Preface
+
+This is an R implementation of a variation of the Edward tutorial ["Getting Started"](http://nbviewer.jupyter.org/github/blei-lab/edward/blob/master/notebooks/getting_started.ipynb) (jupyter notebook).  
+
+*Done per Edward's [license instructions](http://edwardlib.org/license), i.e., [Apache License, version 2.0](https://opensource.org/licenses/Apache-2.0).*
+
+
+# Linear Mixed Effects Models
+
+With linear mixed effects models, we wish to model a linear
+relationship for data points with inputs of varying type, categorized
+into subgroups, and associated to a real-valued output.
+
+We demonstrate with an example in Edward. A webpage version is available 
+[here](http://edwardlib.org/tutorials/linear-mixed-effects-models).
+
+```{r packages, message=FALSE, warning=FALSE}
+library( magrittr )
+library( tidyverse )
+library( reticulate )
+library( tensorflow )
+
+ed <- import( module = "edward" )
+#pd <- import( module = "pandas" )
+np <- import( module = "numpy" )
+
+# Assign the Edward models used in the script.
+Normal <- ed$models$Normal
+
+ed$set_seed(42L)
+
+```
+
+## Data
+
+We use the `InstEval` data set from the popular
+[lme4 R package](http://lme4.r-forge.r-project.org) (Bates, Mächler, Bolker, & Walker, 2015).
+It is a data set of instructor evaluation ratings, where the inputs
+(covariates) include categories such as `students` and
+`departments`, and our response variable of interest is the instructor
+evaluation rating.
+
+```{r data}
+# s - students - 1:2972
+# d - instructors - codes that need to be remapped
+# dept also needs to be remapped
+data <- read_csv('data/insteval.csv')
+data %<>% 
+  rename( index = X1 ) %>%
+  mutate(
+    dcodes    = factor(sprintf("%04d",d)),
+    deptcodes = factor(sprintf("%02d",dept)),
+    s         = s - 1
+  ) %>%
+  select( index, everything() )
+
+train <- data %>% sample_frac( 0.8, replace = FALSE )
+test  <- data %>% filter( !(index %in% train$index) )
+
+train %>% print()
+
+```
+In the code, we denote:
++ `students` as `s`
++ `instructors` as `d`
++ `departments` as `dept`
++ `service` as `service`
+
+```{r preproc}
+sub1L <- function(x) as.integer(x) - 1L
+train_new <- train  %>% 
+  select(index,s,dcodes,deptcodes,service,y) %>% 
+  mutate_at( .funs=funs( sub1L ) , vars(-index,-service,-y) ) %>%
+  mutate( y = as.numeric( y ) )
+
+n_obs_train <- nrow( train_new )
+
+test_new <- test  %>% 
+  select(index,s,dcodes,deptcodes,service,y) %>% 
+  mutate_at( .funs=funs( sub1L ) , vars(-index,-service,-y) ) %>%
+  mutate( y = as.numeric( y ) )
+
+n_obs_test <- nrow( test_new )
+
+```
+
+```{r counts}
+n_s    <- 2972L        # n_s    = length(unique(data$s)) # number of students
+n_d    <- 1128L        # n_d    = length(unique(data$d)) # number of instructors
+n_dept <- 14L          # n_dept = length(unique(data$dept)) # number of departments
+n_obs  <- nrow(train) # number of observations
+
+```
+## Model
+
+With linear regression, one makes an independence assumption where
+each data point regresses with a constant slope among
+each other. In our setting, the observations come from
+groups which may have varying slopes and intercepts. Thus we'd like to
+build a model that can capture this behavior (Gelman & Hill, 2006).
+
+For examples of this phenomena:
++ The observations from a single student are not independent of
+each other. Rather, some students may systematically give low (or
+high) lecture ratings.
++ The observations from a single teacher are not independent of
+each other. We expect good teachers to get generally good ratings and
+bad teachers to get generally bad ratings.
++ The observations from a single department are not independent of
+each other. One department may generally have dry material and thus be
+rated lower than others.
+
+
+Typical linear regression takes the form
+
+\begin{equation*}
+\mathbf{y} = \mathbf{X}\beta + \epsilon,
+\end{equation*}
+
+where $\mathbf{X}$ corresponds to fixed effects with coefficients
+$\beta$ and $\epsilon$ corresponds to random noise,
+$\epsilon\sim\mathcal{N}(\mathbf{0}, \mathbf{I})$.
+
+In a linear mixed effects model, we add an additional term
+$\mathbf{Z}\eta$, where $\mathbf{Z}$ corresponds to random effects
+with coefficients $\eta$. The model takes the form
+
+\begin{align*}
+\eta &\sim \mathcal{N}(\mathbf{0}, \sigma^2 \mathbf{I}), \\
+\mathbf{y} &= \mathbf{X}\beta + \mathbf{Z}\eta + \epsilon.
+\end{align*}
+
+Given data, the goal is to infer $\beta$, $\eta$, and $\sigma^2$,
+where $\beta$ are model parameters ("fixed effects"), $\eta$ are
+latent variables ("random effects"), and $\sigma^2$ is a variance
+component parameter.
+
+Because the random effects have mean 0, the data's mean is captured by
+$\mathbf{X}\beta$. The random effects component $\mathbf{Z}\eta$
+captures variations in the data (e.g.  Instructor \#54 is rated 1.4
+points higher than the mean).
+
+A natural question is the difference between fixed and random effects.
+A fixed effect is an effect that is constant for a given population. A
+random effect is an effect that varies for a given population (i.e.,
+it may be constant within subpopulations but varies within the overall
+population). We illustrate below in our example:
+
++ Select `service` as the fixed effect. It is a binary covariate
+corresponding to whether the lecture belongs to the lecturer's main
+department. No matter how much additional data we collect, it
+can only take on the values in $0$ and $1$.
++ Select the categorical values of `students`, `teachers`,
+and `departments` as the random effects. Given more
+observations from the population of instructor evaluation ratings, we
+may be looking at new students, teachers, or departments.
+
+In the syntax of R's lme4 package (Bates et al., 2015), the model
+can be summarized as
+
+```
+y ~ 1 + (1|students) + (1|instructor) + (1|dept) + service
+```
+where `1` denotes an intercept term,`(1|x)` denotes a
+random effect for `x`, and `x` denotes a fixed effect.
+
+```{r}
+# Set up placeholders for the data inputs.
+s_ph       <- tf$placeholder(tf$int32, NULL)
+d_ph       <- tf$placeholder(tf$int32, NULL)
+dept_ph    <- tf$placeholder(tf$int32, NULL)
+service_ph <- tf$placeholder(tf$float32, NULL)
+
+# Set up fixed effects.
+mu      <- tf$Variable(tf$random_normal(shape()))
+service <- tf$Variable(tf$random_normal(shape()))
+
+sigma_s    <- tf$sqrt(tf$exp(tf$Variable(tf$random_normal(shape()))))
+sigma_d    <- tf$sqrt(tf$exp(tf$Variable(tf$random_normal(shape()))))
+sigma_dept <- tf$sqrt(tf$exp(tf$Variable(tf$random_normal(shape()))))
+
+# Set up random effects.
+eta_s <- Normal(loc=tf$zeros(n_s), scale=sigma_s * tf$ones(n_s))
+eta_d <- Normal(loc=tf$zeros(n_d), scale=sigma_d * tf$ones(n_d))
+eta_dept <- Normal(loc=tf$zeros(n_dept), scale=sigma_dept * tf$ones(n_dept))
+
+# (gather(tensor,indices) selects the values of the specified indices from the tensor)
+yhat <-
+  tf$gather(eta_s, s_ph) + tf$gather(eta_d, d_ph) + tf$gather(eta_dept, dept_ph) + mu + service*service_ph
+
+y <- Normal(loc=yhat, scale=tf$ones(n_obs))
+```

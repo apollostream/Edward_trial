@@ -1,0 +1,104 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+This is an [R Markdown](http://rmarkdown.rstudio.com) Notebook. When you execute code within the notebook, the results appear beneath the code. 
+
+Try executing this chunk by clicking the *Run* button within the chunk or by placing your cursor inside it and pressing *Ctrl+Shift+Enter*. 
+
+```{r packages, message=FALSE, warning=FALSE}
+library( magrittr )
+library( tidyverse )
+library( reticulate )
+library( tensorflow )
+
+tf$reset_default_graph()
+ed   <- import( module = "edward" )
+np   <- import( module = "numpy" )
+ed.m <- import( module = "edward.models" )
+```
+
+Add a new chunk by clicking the *Insert Chunk* button on the toolbar or by pressing *Ctrl+Alt+I*.
+
+When you save the notebook, an HTML file containing the code and output will be saved alongside it (click the *Preview* button or press *Ctrl+Shift+K* to preview the HTML file).
+```{r}
+build_toy_dataset <- function(N, D, K, sigma=1){
+  x_train = np$zeros(c(D, N))
+  w = np$random$normal(0.0, 2.0, size=c(D, K))
+  z = np$random$normal(0.0, 1.0, size=c(K, N))
+  mean = np$dot(w, z)
+  for( d in seq_len(D)){
+    for( n in seq_len(N)){
+      x_train[d, n] = np$random$normal(mean[d, n], sigma)
+    }
+  }
+
+  print("True principal axes:")
+  print(w)
+  return( x_train)
+}
+ed$set_seed(142L)
+
+N = 500L  # number of data points
+D = 20L  # data dimensionality
+K = 1L  # latent dimensionality
+
+sigma = 1.0/np$sqrt(10.0)
+x_train = build_toy_dataset(N, D, K, sigma = sigma )
+```
+```{r}
+data_frame( x= x_train[1, ], y=x_train[2, ]) %>%
+{
+  ggplot(.,aes(x=x,y=y)) +
+    geom_point(color='blue', alpha=0.1) +
+    lims(x=c(-10, 10), y=c(-10, 10)) +
+    ggtitle("Simulated data set")
+} %>%
+  print()
+
+```
+
+```{r}
+w <- ed.m$Normal(loc=tf$zeros(c(D, K)), scale=2.0 * tf$ones(c(D, K)))
+z <- ed.m$Normal(loc=tf$zeros(c(N, K)), scale=tf$ones(c(N, K)))
+x <- ed.m$Normal(loc=tf$matmul(w, z, transpose_b=TRUE), scale= sigma*tf$ones(c(D, N)))
+```
+
+```{r}
+qw <- ed.m$Normal(loc=tf$Variable(tf$random_normal(c(D, K))),
+            scale=tf$nn$softplus(tf$Variable(tf$random_normal(c(D, K)))))
+qz <- ed.m$Normal(loc=tf$Variable(tf$random_normal(c(N, K))),
+            scale=tf$nn$softplus(tf$Variable(tf$random_normal(c(N, K)))))
+```
+
+```{r}
+inference <- ed$KLqp( dict(w = qw, z = qz), data = dict(x = x_train) )
+```
+
+```{r}
+inference$run( n_iter=500L, n_print=100L, n_samples=10L )
+```
+
+```{r}
+sess <- ed$get_session()
+print("Inferred principal axes:")
+print(sess$run(qw$mean()))
+```
+
+```{r}
+# Build and then generate data from the posterior predictive distribution.
+x_post <- ed$copy(x, dict(w = qw, z = qz) )
+x_gen <- sess$run(x_post)
+
+data_frame( x= x_gen[1, ], y=x_gen[2, ]) %>%
+{
+  ggplot(.,aes(x=x,y=y)) +
+    geom_point(color='red', alpha=0.1) +
+    lims(x=c(-10, 10), y=c(-10, 10)) +
+    ggtitle("Data generated from model")
+} %>%
+  print()
+
+```
+
