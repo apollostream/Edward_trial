@@ -1,0 +1,302 @@
+---
+title: 'Edward: Latent Space Models for Neural Data'
+author: "Michael L. Thompson"
+date: "Sept. 10, 2017"
+output:
+  html_notebook:
+    toc: yes
+  html_document:
+    toc: yes
+  pdf_document:
+    toc: yes
+    toc_depth: 4
+linkcolor: red
+urlcolor: blue
+---
+
+## Preface
+
+This is an R implementation of the Edward tutorial ["Latent Space Models for Neural Data"](http://nbviewer.jupyter.org/github/blei-lab/edward/blob/master/notebooks/latent_space_models.ipynb) (jupyter notebook).  
+
+*Done per Edward's [license instructions](http://edwardlib.org/license), i.e., [Apache License, version 2.0](https://opensource.org/licenses/Apache-2.0).*
+
+See the [Appendix](#appendix) for instructions on setting up R to run Python, TensorFlow, and Edward.
+
+[*Michael L. Thompson*](https://www.linkedin.com/in/mlthomps)
+
+## Setup
+
+Load the R packages we need.  
+Note that in all that follows, the R code explicitly specifies integer constants as being long integers by appending "`L`" to the number. This is
+necessary for proper interfacing with Python using the `reticulate` package in R.
+
+```{r setup, message=FALSE, warning=FALSE}
+library( magrittr )
+library( tidyverse )
+library( reticulate )
+library( tensorflow )
+
+library( igraph )
+
+use_virtualenv("tensorflow")
+
+
+```
+## Latent Space Models for Neural Data
+
+Many scientific fields involve the study of network data, including
+social networks, networks in statistical physics, biological
+networks, and information networks
+(Goldenberg, Zheng, Fienberg, & Airoldi, 2010; Newman, 2010).
+
+What we can learn about nodes in a network from their connectivity patterns?
+We can begin to study this using a latent space model (Hoff, Raftery, & Handcock, 2002).
+Latent space models embed nodes in the network in a latent space,
+where the likelihood of forming an edge between two nodes depends on
+their distance in the latent space.
+
+We will analyze network data from neuroscience.
+A webpage version is available at
+http://edwardlib.org/tutorials/latent-space-models.
+
+
+*Load the Python modules we need.*
+Be sure that each of Python modules has first been installed 
+(e.g., using `pip3` at the operating system/shell command prompt).
+
+
+```{r python}
+ed   <- import( module = "edward" )
+np   <- import( module = "numpy" )
+six  <- import( module = "six" )
+obs  <- import( module = "observations" )
+celegans <- obs$celegans
+
+# Assign the Edward models used in the script.
+#from edward.models import 
+
+Normal  <- ed$models$Normal
+Poisson <- ed$models$Poisson
+
+
+```
+
+### Data
+
+The data comes from [Mark Newman's repository](http://www-personal.umich.edu/~mejn/netdata/).
+It is a weighted, directed network representing the neural network of
+the nematode
+[C. Elegans](https://en.wikipedia.org/wiki/Caenorhabditis_elegans)
+compiled by Watts & Strogatz (1998) using experimental data
+by White, Southgate, Thomson, & Brenner (1986).
+
+The neural network consists of around $300$ neurons. Each connection
+between neurons
+is associated with a weight (positive integer) capturing the strength
+of the connection.
+
+First, we load the data.
+
+
+```{r get_data}
+# *** COULDN'T GET `celegans("~/data")` TO WORK IN PYTHON. SO USE R's `igraph` PACKAGE. ***
+#
+# *** ERROR IN JUPYTER NOTEBOOK LOOKS LIKE THIS:
+#
+#    >> x_train = celegans("~/data")
+#    >> Downloading celegansneural.zip 129.1%
+#    Successfully downloaded celegansneural.zip 12687 bytes.
+#    ---------------------------------------------------------------------------
+#    NetworkXError: cannot tokenize 'graph' at (2, 1)
+# ***
+
+#x_train = celegans("~/data")
+net     <- read_graph( "data/celegansneural/celegansneural.gml", format = "gml" )
+plot( net , vertex.color = 'cyan' )
+
+x_train <- net %>% 
+  get.adjacency() %>%
+  as.matrix() %>%
+  r_to_py()
+```
+
+### Model
+
+What can we learn about the neurons from their connectivity patterns? Using
+a latent space model (Hoff et al., 2002), we will learn a latent
+embedding for each neuron to capture the similarities between them.
+
+Each neuron $n$ is a node in the network and is associated with a latent
+position $z_n\in\mathbb{R}^K$.
+We place a Gaussian prior on each of the latent positions.
+
+The log-odds of an edge between node $i$ and
+$j$ is proportional to the Euclidean distance between the latent
+representations of the nodes $|z_i- z_j|$. Here, we
+model the weights ($Y_{ij}$) of the edges with a Poisson likelihood.
+The rate is the reciprocal of the distance in latent space. The
+generative process is as follows:
+
+1. 
+For each node $n=1,\ldots,N$,
+$$
+\begin{aligned}
+z_n \sim N(0,I).
+\end{aligned}
+$$
+2. 
+For each edge $(i,j)\in\{1,\ldots,N\}\times\{1,\ldots,N\}$,
+$$
+\begin{aligned}
+Y_{ij} \sim \text{Poisson}\Bigg(\frac{1}{|z_i - z_j|}\Bigg).
+\end{aligned}
+$$
+
+In Edward, we write the model as follows.
+
+
+```{r model}
+N <- x_train$shape[[0L]]  # number of data points
+K <- 6L  # latent dimensionality
+
+z <- Normal( loc = tf$zeros(list(N, K)), scale = tf$ones(list(N, K)))
+
+# Calculate N x N distance matrix.
+# 1. Create a vector, [||z_1||^2, ||z_2||^2, ..., ||z_N||^2], and tile
+# it to create N identical rows.
+xp <- tf$tile(tf$reduce_sum(tf$pow(z, 2), 1L, keep_dims=TRUE), list(1L, N))
+# 2. Create a N x N matrix where entry (i, j) is ||z_i||^2 + ||z_j||^2
+# - 2 z_i^T z_j.
+xp <- xp + tf$transpose(xp) - 2 * tf$matmul(z, z, transpose_b=TRUE)
+# 3. Invert the pairwise distances and make rate along diagonals to
+# be close to zero.
+xp <- 1.0 / tf$sqrt(xp + tf$diag(tf$zeros(N) + 1e3))
+
+x <- Poisson( rate = xp )
+```
+
+### Inference
+
+Maximum a posteriori (MAP) estimation is simple in Edward. Two lines are
+required: Instantiating inference and running it.
+
+
+```{r infer}
+inference <- ed$MAP( list(z), data = dict( x = x_train ) )
+```
+
+See this extended tutorial about
+[MAP estimation in Edward](http://edwardlib.org/tutorials/map).
+
+One could instead run variational inference. This requires specifying
+a variational model and instantiating `KLqp`.
+
+
+```{python eval=FALSE}
+# Alternatively, run
+# qz = Normal(loc=tf.Variable(tf.random_normal([N * K])),
+#             scale=tf.nn.softplus(tf.Variable(tf.random_normal([N * K]))))
+# inference = ed.KLqp({z: qz}, data={x: x_train})
+```
+
+See this extended tutorial about
+[variational inference in Edward](http://edwardlib.org/tutorials/variational-inference).
+
+Finally, the following line runs the inference procedure for 2500
+iterations.
+
+
+```{r train}
+inference$run( n_iter = 2500L , n_print = 0L)
+```
+
+    2500/2500 [100%] ██████████████████████████████ Elapsed: 11s | Loss: 35984.855
+    
+```{r post}
+as_data_frame(net,what="edges") %>%
+  as_tibble() %>%
+  group_by( from ) %>%
+  tally() %>%
+  slice( which.max(n) ) %>%
+  as.matrix() %>%
+  print()
+
+z_soln <- inference$latent_vars[[1]]$eval() %>% 
+  as_tibble() %>% 
+  setNames(sprintf("Z%d",seq_len(ncol(.)))) %>%
+  bind_cols( as_data_frame(net,what="vertices") %>% mutate(id=id+1) )
+
+z_soln %>% mutate(is_nbr_3 = id %in% neighbors(net,v=3)) %>% {
+  ggplot(.,aes(x=Z1,y=Z2,label=id, color = is_nbr_3 ) ) +
+    geom_point() +
+    geom_text( nudge_y = 0.1 )
+} %>% print()
+
+if( K > 2 ) {
+  z_soln %>% mutate(is_nbr_3 = id %in% neighbors(net,v=3)) %>% {
+    ggplot(.,aes(x=Z1,y=Z3,label=id, color = is_nbr_3 ) ) +
+      geom_point() +
+      geom_text( nudge_y = 0.1 )
+  } %>% print()
+  z_soln %>% mutate(is_nbr_3 = id %in% neighbors(net,v=3)) %>% {
+    ggplot(.,aes(x=Z2,y=Z3,label=id, color = is_nbr_3 ) ) +
+      geom_point() +
+      geom_text( nudge_y = 0.1 )
+  } %>% print()
+}
+
+```
+
+## Acknowledgments
+
+**We thank Maja Rudolph for writing the initial version of this tutorial.**
+
+
+## MLT Comments
+
+Things I found to be odd or just plain 'ol points of frustration...:
+
++   **Why no `session`?**:  I'm not sure why either a TensorFlow or Edward `session` object isn't created in this tutorial.
+    +   I can't say I've arrived yet at a standard workflow with specifying models and performing inference
+        with Edward.  I'm far away from being confident that an implementation based upon Edward will work
+        reliably for any given application I'm developing....
+
++   **The Inference Progress Bar**:  Still haven't figured how to get that to work in R under RStudio.
+    +   Seems may just need to set RStudio display w/in R Markdown to UTF-8 character encoding.  Not sure how....
+
++   **Better Model Criticism**: It's also unclear how to do model criticism (e.g., posterior predictive checking, etc.) for this particular
+model.
+    +   I played around a bit with comparing random realizations of `xp` with the input adjacency matrix
+        `x_train`, but I didn't find anything particularly conclusive wrt goodness of fit or useful
+        for model selection, i.e., selection of the number of latent dimensions `K`.
+        
++   **Better Graph Visualization**: There's got to be a better way to make legible and aesthetically pleasing plots of graphs/networks
+    using `igraph` besides blind trial and error....
+    +   Previously, on other applications, I've played around with `Rgraphviz` and `Diagrammer`.
+    
++   **Usual Finicky Python Packages**: I just have no clue as to why the `observations` package didn't
+    work at reading in the graph data.
+    +   This is a sore point with me and Python: Why can't the damned packages work as well as the packages
+        in R?!
+    +   With Python, I spend far more time just trying to get packages installed and working properly than
+        I do with R.  Even when I'm running in my Ubuntu Linux virtual box.  Whatever....
+        
+
+
+## Appendix {#appendix}
+
+Assuming R and RStudio already installed, this implementation (under Windows 10) was made possible by installing Python and the TensorFlow and Edward modules, and then the `reticulate` and `tensorflow` packages in R, per the instructions at the following links:
+
++    Python setup:
+     +    Python: [Python, Download the latest version for Windows](https://www.python.org/downloads/)
+     +    TensorFlow: [Installing TensorFlow on Windows](https://www.tensorflow.org/install/install_windows)
+     +    Edward: [Edward, Getting Started](http://edwardlib.org/getting-started)
+     +    Also `pip`-ed `numpy` and `jupyter`.
++    R setup:
+     +    Package `reticulate`: [R Interface to Python](https://cran.r-project.org/web/packages/reticulate/vignettes/introduction.html)
+     +    Package `tensorflow`: [TensorFlow for R](https://rstudio.github.io/tensorflow/index.html)
+     
+(*This notebook also uses R packages `magrittr` & `tidyverse`, which are my go-to tools for data science in R.*)
+
+[*Michael L. Thompson*](https://www.linkedin.com/in/mlthomps)
+
